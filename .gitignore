@@ -60,3 +60,7 @@ logs/
 
 # Uvicorn / local runtime
 *.pid
+
+
+# Testing
+/test
