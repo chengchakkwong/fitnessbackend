@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import os
@@ -7,6 +8,7 @@ from typing import Annotated, Any, List, Literal
 from uuid import UUID
 
 import jwt
+from PIL import Image, UnidentifiedImageError
 from jwt import PyJWKClient
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -41,6 +43,10 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 DEBUG = os.getenv("DEBUG", "true").lower() in ("1", "true", "yes")
 REFINE_MAX_ROUNDS = int(os.getenv("REFINE_MAX_ROUNDS", "5"))
+MEAL_PHOTOS_BUCKET = os.getenv("MEAL_PHOTOS_BUCKET", "meal-photos")
+IMAGE_SIGNED_URL_EXPIRES = int(os.getenv("IMAGE_SIGNED_URL_EXPIRES", "3600"))
+JPEG_MAX_SIDE = int(os.getenv("JPEG_MAX_SIDE", "2048"))
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))
 
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_JWT_ISSUER = f"{SUPABASE_URL}/auth/v1" if SUPABASE_URL else ""
@@ -287,6 +293,82 @@ def _parse_json_form_field(raw: str, field_name: str) -> Any:
         ) from exc
 
 
+def image_bytes_to_jpeg(
+    raw: bytes,
+    max_side: int = JPEG_MAX_SIDE,
+    quality: int = JPEG_QUALITY,
+) -> bytes:
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+
+            width, height = img.size
+            longest = max(width, height)
+            if longest > max_side:
+                scale = max_side / longest
+                img = img.resize(
+                    (int(width * scale), int(height * scale)),
+                    Image.Resampling.LANCZOS,
+                )
+
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            return buf.getvalue()
+    except UnidentifiedImageError as exc:
+        raise HTTPException(
+            status_code=400, detail="無法辨識的圖片格式，請重新上傳。"
+        ) from exc
+
+
+def meal_storage_path(user_id: str, meal_id: str) -> str:
+    return f"{user_id}/{meal_id}.jpg"
+
+
+def _extract_signed_url(response: Any) -> str | None:
+    if response is None:
+        return None
+    if isinstance(response, dict):
+        nested = response.get("data")
+        if isinstance(nested, dict):
+            url = nested.get("signedURL") or nested.get("signedUrl")
+            if url:
+                return str(url)
+        url = response.get("signedURL") or response.get("signedUrl")
+        return str(url) if url else None
+    for attr in ("signed_url", "signedURL", "signedUrl"):
+        value = getattr(response, attr, None)
+        if value:
+            return str(value)
+    return None
+
+
+def upload_meal_photo(supabase: Client, path: str, jpeg_bytes: bytes) -> None:
+    supabase.storage.from_(MEAL_PHOTOS_BUCKET).upload(
+        path,
+        jpeg_bytes,
+        file_options={"content-type": "image/jpeg", "upsert": "false"},
+    )
+
+
+def delete_meal_photo(supabase: Client, image_path: str) -> None:
+    supabase.storage.from_(MEAL_PHOTOS_BUCKET).remove([image_path])
+
+
+def signed_url_for_image(supabase: Client, image_path: str) -> str | None:
+    try:
+        response = supabase.storage.from_(MEAL_PHOTOS_BUCKET).create_signed_url(
+            image_path,
+            IMAGE_SIGNED_URL_EXPIRES,
+        )
+        return _extract_signed_url(response)
+    except Exception as exc:
+        logger.warning("create_signed_url failed for %s: %s", image_path, exc)
+        return None
+
+
 # =====================================================================
 # Pydantic 數據模型
 # =====================================================================
@@ -363,6 +445,16 @@ class MealOut(BaseModel):
     analysis_source: str
     reused_from_meal_id: str | None = None
     image_path: str | None = None
+    image_url: str | None = None
+
+
+def _meal_row_to_meal_out(supabase: Client, row: dict[str, Any]) -> MealOut:
+    payload = _meal_row_to_dict(row)
+    image_path = payload.get("image_path")
+    payload["image_url"] = (
+        signed_url_for_image(supabase, image_path) if image_path else None
+    )
+    return MealOut.model_validate(payload)
 
 
 # =====================================================================
@@ -454,9 +546,25 @@ async def refine_food(
 # =====================================================================
 @app.post("/api/meals", response_model=MealOut, status_code=201)
 async def create_meal(
-    body: MealCreateP15,
-    user_id: Annotated[str, Depends(get_current_user_id)],
+    file: UploadFile = File(...),
+    meal_json: str = Form(...),
+    user_id: Annotated[str, Depends(get_current_user_id)] = "",
 ):
+    mime_type = resolve_image_mime_type(file.content_type, file.filename)
+    if not mime_type:
+        raise HTTPException(status_code=400, detail="這不是照片喵！請上傳正確的圖片格式。")
+
+    meal_data = _parse_json_form_field(meal_json, "meal_json")
+    try:
+        body = MealCreateP15.model_validate(meal_data)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="meal_json 欄位格式不正確") from exc
+
+    await file.seek(0)
+    image_bytes = await read_upload_with_limit(file, MAX_UPLOAD_BYTES)
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="上傳的檔案是空的喵！")
+
     supabase = get_supabase_admin()
     row = {
         "user_id": user_id,
@@ -480,7 +588,7 @@ async def create_meal(
     try:
         response = supabase.table("meals").insert(row).execute()
     except Exception as exc:
-        logger.exception("create_meal failed")
+        logger.exception("create_meal insert failed")
         detail = "無法儲存到日記，請稍後再試。"
         if DEBUG:
             detail = f"{detail} ({type(exc).__name__}: {exc})"
@@ -488,7 +596,52 @@ async def create_meal(
 
     if not response.data:
         raise HTTPException(status_code=500, detail="儲存失敗（無回傳資料）")
-    return MealOut.model_validate(_meal_row_to_dict(response.data[0]))
+
+    inserted = response.data[0]
+    meal_id = str(inserted["id"])
+    storage_path = meal_storage_path(user_id, meal_id)
+
+    try:
+        jpeg_bytes = image_bytes_to_jpeg(image_bytes)
+        upload_meal_photo(supabase, storage_path, jpeg_bytes)
+        update_response = (
+            supabase.table("meals")
+            .update({"image_path": storage_path})
+            .eq("id", meal_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        if not update_response.data:
+            raise RuntimeError("更新 image_path 失敗")
+        return _meal_row_to_meal_out(supabase, update_response.data[0])
+    except HTTPException:
+        try:
+            delete_meal_photo(supabase, storage_path)
+        except Exception:
+            pass
+        try:
+            supabase.table("meals").delete().eq("id", meal_id).eq(
+                "user_id", user_id
+            ).execute()
+        except Exception:
+            logger.exception("create_meal rollback failed for %s", meal_id)
+        raise
+    except Exception as exc:
+        logger.exception("create_meal storage failed for %s", meal_id)
+        try:
+            delete_meal_photo(supabase, storage_path)
+        except Exception:
+            pass
+        try:
+            supabase.table("meals").delete().eq("id", meal_id).eq(
+                "user_id", user_id
+            ).execute()
+        except Exception:
+            logger.exception("create_meal rollback failed for %s", meal_id)
+        detail = "照片儲存失敗，日記未建立，請稍後再試。"
+        if DEBUG:
+            detail = f"{detail} ({type(exc).__name__}: {exc})"
+        raise HTTPException(status_code=500, detail=detail) from exc
 
 
 @app.get("/api/meals", response_model=list[MealOut])
@@ -515,7 +668,7 @@ async def list_meals(
         raise HTTPException(status_code=500, detail=detail) from exc
 
     rows = response.data or []
-    return [MealOut.model_validate(_meal_row_to_dict(r)) for r in rows]
+    return [_meal_row_to_meal_out(supabase, r) for r in rows]
 
 
 @app.get("/api/meals/{meal_id}", response_model=MealOut)
@@ -535,7 +688,7 @@ async def get_meal(
 
     if row is None:
         raise HTTPException(status_code=404, detail="找不到此餐點")
-    return MealOut.model_validate(_meal_row_to_dict(row))
+    return _meal_row_to_meal_out(supabase, row)
 
 
 @app.delete("/api/meals/{meal_id}", status_code=204)
@@ -547,6 +700,15 @@ async def delete_meal(
     row = _fetch_meal_for_user(supabase, meal_id, user_id)
     if row is None:
         raise HTTPException(status_code=404, detail="找不到此餐點")
+
+    image_path = row.get("image_path")
+    if image_path:
+        try:
+            delete_meal_photo(supabase, image_path)
+        except Exception as exc:
+            logger.warning(
+                "delete_meal storage failed for %s: %s", image_path, exc
+            )
 
     try:
         supabase.table("meals").delete().eq("id", str(meal_id)).eq(
