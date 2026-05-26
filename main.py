@@ -1,12 +1,15 @@
 import logging
 import os
 from pathlib import Path
-from typing import Annotated, List
+from datetime import datetime
+from typing import Annotated, Any, List
+from uuid import UUID
 
 import jwt
 from jwt import PyJWKClient
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from supabase import Client, create_client
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -48,7 +51,15 @@ _jwks_client: PyJWKClient | None = (
     else None
 )
 
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+_supabase_admin: Client | None = None
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    _supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
 bearer_scheme = HTTPBearer(auto_error=False)
+
+MEALS_DEFAULT_LIMIT = 20
+MEALS_MAX_LIMIT = 100
 
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 EXTENSION_TO_MIME = {
@@ -167,6 +178,54 @@ def get_current_user_id(
     return user_id
 
 
+def get_supabase_admin() -> Client:
+    if _supabase_admin is None:
+        logger.error("Supabase service role is not configured")
+        raise HTTPException(
+            status_code=503,
+            detail="伺服器尚未設定資料庫連線（SUPABASE_SERVICE_ROLE_KEY）",
+        )
+    return _supabase_admin
+
+
+def _meal_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "user_id": str(row["user_id"]),
+        "created_at": row["created_at"],
+        "dish_name": row["dish_name"],
+        "calories_kcal": row["calories_kcal"],
+        "protein_g": row["protein_g"],
+        "carbs_g": row["carbs_g"],
+        "fat_g": row["fat_g"],
+        "visual_clues": row.get("visual_clues") or [],
+        "assumption_and_blindspots": row["assumption_and_blindspots"],
+        "confidence_score": row["confidence_score"],
+        "cheeky_cat_comment": row["cheeky_cat_comment"],
+        "user_correction_note": row.get("user_correction_note"),
+        "analysis_source": row["analysis_source"],
+        "reused_from_meal_id": (
+            str(row["reused_from_meal_id"]) if row.get("reused_from_meal_id") else None
+        ),
+        "image_path": row.get("image_path"),
+    }
+
+
+def _fetch_meal_for_user(
+    supabase: Client, meal_id: UUID, user_id: str
+) -> dict[str, Any] | None:
+    response = (
+        supabase.table("meals")
+        .select("*")
+        .eq("id", str(meal_id))
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
 # =====================================================================
 # 2. 鋼鐵 Pydantic 數據模型
 # =====================================================================
@@ -180,6 +239,32 @@ class NutritionalAnalysis(BaseModel):
     assumption_and_blindspots: str = Field(description="你在估算時做了什麼份量假設？有哪些物理盲點")
     confidence_score: float = Field(ge=0.0, le=1.0, description="你對這次辨識結果的信心指數（0.0 到 1.0）")
     cheeky_cat_comment: str = Field(description="毒舌健身教練貓 CheekyCat 的繁體中文機車吐槽")
+
+
+class MealCreate(NutritionalAnalysis):
+    user_correction_note: str | None = Field(
+        default=None,
+        description="使用者修正提示詞（可選）",
+    )
+
+
+class MealOut(BaseModel):
+    id: str
+    user_id: str
+    created_at: datetime
+    dish_name: str
+    calories_kcal: int
+    protein_g: float
+    carbs_g: float
+    fat_g: float
+    visual_clues: List[str]
+    assumption_and_blindspots: str
+    confidence_score: float
+    cheeky_cat_comment: str
+    user_correction_note: str | None = None
+    analysis_source: str
+    reused_from_meal_id: str | None = None
+    image_path: str | None = None
 
 
 # =====================================================================
@@ -233,14 +318,111 @@ async def analyze_food(file: UploadFile = File(...)):
 
 
 # =====================================================================
-# 4. 日記 API（P0 stub；P1 接 Supabase meals 表）
+# 4. 日記 API（P1：Supabase meals + service role）
 # =====================================================================
-@app.get("/api/meals")
-async def list_meals(
+@app.post("/api/meals", response_model=MealOut, status_code=201)
+async def create_meal(
+    body: MealCreate,
     user_id: Annotated[str, Depends(get_current_user_id)],
 ):
-    _ = user_id
-    return []
+    supabase = get_supabase_admin()
+    row = {
+        "user_id": user_id,
+        "dish_name": body.dish_name,
+        "calories_kcal": body.calories_kcal,
+        "protein_g": body.protein_g,
+        "carbs_g": body.carbs_g,
+        "fat_g": body.fat_g,
+        "visual_clues": body.visual_clues,
+        "assumption_and_blindspots": body.assumption_and_blindspots,
+        "confidence_score": body.confidence_score,
+        "cheeky_cat_comment": body.cheeky_cat_comment,
+        "user_correction_note": body.user_correction_note,
+        "analysis_source": "gemini_fresh",
+    }
+    try:
+        response = supabase.table("meals").insert(row).execute()
+    except Exception as exc:
+        logger.exception("create_meal failed")
+        detail = "無法儲存到日記，請稍後再試。"
+        if DEBUG:
+            detail = f"{detail} ({type(exc).__name__}: {exc})"
+        raise HTTPException(status_code=500, detail=detail) from exc
+
+    if not response.data:
+        raise HTTPException(status_code=500, detail="儲存失敗（無回傳資料）")
+    return MealOut.model_validate(_meal_row_to_dict(response.data[0]))
+
+
+@app.get("/api/meals", response_model=list[MealOut])
+async def list_meals(
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    limit: int = Query(default=MEALS_DEFAULT_LIMIT, ge=1, le=MEALS_MAX_LIMIT),
+    offset: int = Query(default=0, ge=0),
+):
+    supabase = get_supabase_admin()
+    try:
+        response = (
+            supabase.table("meals")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("list_meals failed")
+        detail = "無法讀取日記列表。"
+        if DEBUG:
+            detail = f"{detail} ({type(exc).__name__}: {exc})"
+        raise HTTPException(status_code=500, detail=detail) from exc
+
+    rows = response.data or []
+    return [MealOut.model_validate(_meal_row_to_dict(r)) for r in rows]
+
+
+@app.get("/api/meals/{meal_id}", response_model=MealOut)
+async def get_meal(
+    meal_id: UUID,
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    supabase = get_supabase_admin()
+    try:
+        row = _fetch_meal_for_user(supabase, meal_id, user_id)
+    except Exception as exc:
+        logger.exception("get_meal failed")
+        detail = "無法讀取餐點詳情。"
+        if DEBUG:
+            detail = f"{detail} ({type(exc).__name__}: {exc})"
+        raise HTTPException(status_code=500, detail=detail) from exc
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="找不到此餐點")
+    return MealOut.model_validate(_meal_row_to_dict(row))
+
+
+@app.delete("/api/meals/{meal_id}", status_code=204)
+async def delete_meal(
+    meal_id: UUID,
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    supabase = get_supabase_admin()
+    row = _fetch_meal_for_user(supabase, meal_id, user_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="找不到此餐點")
+
+    try:
+        supabase.table("meals").delete().eq("id", str(meal_id)).eq(
+            "user_id", user_id
+        ).execute()
+    except Exception as exc:
+        logger.exception("delete_meal failed")
+        detail = "無法刪除此餐點。"
+        if DEBUG:
+            detail = f"{detail} ({type(exc).__name__}: {exc})"
+        raise HTTPException(status_code=500, detail=detail) from exc
+
+    return None
 
 
 if __name__ == "__main__":
