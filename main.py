@@ -1,11 +1,14 @@
 import logging
 import os
 from pathlib import Path
-from typing import List
+from typing import Annotated, List
 
+import jwt
+from jwt import PyJWKClient
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 import google.generativeai as genai
 
@@ -36,6 +39,16 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 # 🚀 預設開啟 DEBUG，讓前端直接能看到報錯真兇
 DEBUG = os.getenv("DEBUG", "true").lower() in ("1", "true", "yes")
+
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_JWT_ISSUER = f"{SUPABASE_URL}/auth/v1" if SUPABASE_URL else ""
+_jwks_client: PyJWKClient | None = (
+    PyJWKClient(f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json")
+    if SUPABASE_URL
+    else None
+)
+
+bearer_scheme = HTTPBearer(auto_error=False)
 
 ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 EXTENSION_TO_MIME = {
@@ -122,6 +135,38 @@ def parse_gemini_json_response(response) -> str:
     return clean_json
 
 
+def get_current_user_id(
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
+    ],
+) -> str:
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="未提供登入憑證")
+    if _jwks_client is None:
+        logger.error("SUPABASE_URL is not configured")
+        raise HTTPException(status_code=503, detail="伺服器尚未設定 JWT 驗證")
+
+    token = credentials.credentials
+    try:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["ES256"],
+            audience="authenticated",
+            issuer=SUPABASE_JWT_ISSUER,
+        )
+    except jwt.PyJWTError as exc:
+        logger.warning("JWT validation failed: %s", exc)
+        raise HTTPException(status_code=401, detail="登入憑證無效或已過期") from exc
+
+    user_id = payload.get("sub")
+    if not user_id or not isinstance(user_id, str):
+        raise HTTPException(status_code=401, detail="登入憑證缺少使用者識別")
+
+    return user_id
+
+
 # =====================================================================
 # 2. 鋼鐵 Pydantic 數據模型
 # =====================================================================
@@ -185,6 +230,17 @@ async def analyze_food(file: UploadFile = File(...)):
         if DEBUG:
             detail = f"{detail} 🚨 真兇: {type(e).__name__} -> {str(e)}"
         raise HTTPException(status_code=500, detail=detail) from e
+
+
+# =====================================================================
+# 4. 日記 API（P0 stub；P1 接 Supabase meals 表）
+# =====================================================================
+@app.get("/api/meals")
+async def list_meals(
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    _ = user_id
+    return []
 
 
 if __name__ == "__main__":
