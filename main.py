@@ -1,14 +1,15 @@
+import json
 import logging
 import os
 from pathlib import Path
 from datetime import datetime
-from typing import Annotated, Any, List
+from typing import Annotated, Any, List, Literal
 from uuid import UUID
 
 import jwt
 from jwt import PyJWKClient
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from supabase import Client, create_client
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -28,7 +29,6 @@ if not API_KEY:
 
 genai.configure(api_key=API_KEY)
 
-# CORS 網域防禦守門員配置
 DEFAULT_CORS_ORIGINS = (
     "http://localhost:3000,"
     "http://127.0.0.1:3000,"
@@ -37,11 +37,10 @@ DEFAULT_CORS_ORIGINS = (
 _raw_origins = os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS)
 CORS_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
-# 🚀 降落回最穩定、絕對不會報 404 找不到的真實模型版本
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
-# 🚀 預設開啟 DEBUG，讓前端直接能看到報錯真兇
 DEBUG = os.getenv("DEBUG", "true").lower() in ("1", "true", "yes")
+REFINE_MAX_ROUNDS = int(os.getenv("REFINE_MAX_ROUNDS", "5"))
 
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_JWT_ISSUER = f"{SUPABASE_URL}/auth/v1" if SUPABASE_URL else ""
@@ -71,6 +70,12 @@ EXTENSION_TO_MIME = {
     ".heif": "image/heif",
 }
 
+JSON_SCHEMA_HINT = (
+    '{"dish_name": "字串", "calories_kcal": 整數, "protein_g": 浮點數, "carbs_g": 浮點數, '
+    '"fat_g": 浮點數, "visual_clues": ["字串列表"], "assumption_and_blindspots": "字串", '
+    '"confidence_score": 浮點數, "cheeky_cat_comment": "字串"}'
+)
+
 app = FastAPI(title="Project CheekyCat - AI Fitness Backend")
 
 app.add_middleware(
@@ -83,7 +88,7 @@ app.add_middleware(
 
 
 # =====================================================================
-# 🛠️ 輔助工具函數
+# 輔助工具函數
 # =====================================================================
 def resolve_image_mime_type(content_type: str | None, filename: str | None) -> str | None:
     if content_type and content_type.startswith("image/"):
@@ -135,14 +140,13 @@ def parse_gemini_json_response(response) -> str:
             status_code=422,
             detail="圖片無法分析（回應為空）",
         )
-    
-    # 🚀 自動防禦清理：剔除 ```json 標籤
+
     clean_json = text.strip()
     if clean_json.startswith("```json"):
         clean_json = clean_json.split("```json")[1].split("```")[0].strip()
     elif clean_json.startswith("```"):
         clean_json = clean_json.split("```")[1].split("```")[0].strip()
-        
+
     return clean_json
 
 
@@ -188,6 +192,49 @@ def get_supabase_admin() -> Client:
     return _supabase_admin
 
 
+def build_analyze_prompt(context_text: str | None) -> str:
+    prompt = (
+        "你是一隻叫 CheekyCat 的毒舌健身教練貓，同時也是一位極其嚴格的臨床營養學專家。\n"
+        "請仔細審查這張圖片中的食物，並根據以下 JSON 結構回傳報告，不要有任何多餘的文字。\n\n"
+        f"【必須包含的 JSON 鍵值】：\n{JSON_SCHEMA_HINT}\n\n"
+        "【三大鋼鐵審計指令】：\n"
+        "1. 科學基準定錨：遵循每 100g 標準成分進行還原估算。\n"
+        "2. 誠實揭露盲點：老實交代 2D 俯拍照片帶來的物理限制，不准隱瞞誤差！\n"
+        "3. 注入機車貓魂：`cheeky_cat_comment` 必須極度毒舌，狠狠吐槽使用者的罪惡熱量，並用『喵～』作為傲嬌語氣的靈魂結尾。"
+    )
+    if context_text and context_text.strip():
+        prompt += (
+            f"\n\n【使用者補充（圖片中不可見，請納入估算）】：\n{context_text.strip()}"
+        )
+    return prompt
+
+
+def build_refine_prompt(
+    message: str,
+    versions: list[dict[str, Any]],
+    conversation: list[dict[str, Any]],
+    upload_context_text: str | None,
+) -> str:
+    versions_blob = json.dumps(versions, ensure_ascii=False, indent=2)
+    conversation_blob = json.dumps(conversation, ensure_ascii=False, indent=2)
+    prompt = (
+        "你是一隻叫 CheekyCat 的毒舌健身教練貓，同時也是一位極其嚴格的臨床營養學專家。\n"
+        "使用者已上傳同一張食物照片，並透過對話要求你修正營養估算。\n"
+        "請根據原圖、既有版本、對話歷史與本輪使用者訊息，產出**全新完整**的營養分析 JSON。\n\n"
+        f"【必須包含的 JSON 鍵值】：\n{JSON_SCHEMA_HINT}\n\n"
+        f"【既有分析版本】：\n{versions_blob}\n\n"
+        f"【對話歷史】：\n{conversation_blob}\n\n"
+        f"【本輪使用者修正】：\n{message.strip()}\n\n"
+        "請重新估算熱量與巨量，並在 assumption_and_blindspots 說明你如何採納使用者修正。"
+        "cheeky_cat_comment 維持毒舌繁中並以『喵～』結尾。"
+    )
+    if upload_context_text and upload_context_text.strip():
+        prompt += (
+            f"\n\n【分析前使用者曾補充（圖中不可見）】：\n{upload_context_text.strip()}"
+        )
+    return prompt
+
+
 def _meal_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": str(row["id"]),
@@ -203,6 +250,11 @@ def _meal_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
         "confidence_score": row["confidence_score"],
         "cheeky_cat_comment": row["cheeky_cat_comment"],
         "user_correction_note": row.get("user_correction_note"),
+        "upload_mode": row.get("upload_mode") or "default",
+        "upload_context_text": row.get("upload_context_text"),
+        "chosen_version_index": row.get("chosen_version_index", 0),
+        "analysis_versions": row.get("analysis_versions") or [],
+        "conversation": row.get("conversation") or [],
         "analysis_source": row["analysis_source"],
         "reused_from_meal_id": (
             str(row["reused_from_meal_id"]) if row.get("reused_from_meal_id") else None
@@ -226,8 +278,17 @@ def _fetch_meal_for_user(
     return rows[0] if rows else None
 
 
+def _parse_json_form_field(raw: str, field_name: str) -> Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"{field_name} 格式不正確"
+        ) from exc
+
+
 # =====================================================================
-# 2. 鋼鐵 Pydantic 數據模型
+# Pydantic 數據模型
 # =====================================================================
 class NutritionalAnalysis(BaseModel):
     dish_name: str = Field(description="食物的英文與繁體中文名稱")
@@ -241,11 +302,43 @@ class NutritionalAnalysis(BaseModel):
     cheeky_cat_comment: str = Field(description="毒舌健身教練貓 CheekyCat 的繁體中文機車吐槽")
 
 
-class MealCreate(NutritionalAnalysis):
-    user_correction_note: str | None = Field(
-        default=None,
-        description="使用者修正提示詞（可選）",
+class AnalysisVersionItem(NutritionalAnalysis):
+    version_index: int
+    source: Literal["initial", "chat_refine"]
+
+
+class ConversationItem(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+    version_index: int
+    cheeky_cat_comment: str | None = None
+
+
+class MealCreateP15(NutritionalAnalysis):
+    chosen_version_index: int = Field(ge=0)
+    upload_mode: Literal["default", "with_context"] = "default"
+    upload_context_text: str | None = None
+    analysis_versions: List[AnalysisVersionItem]
+    conversation: List[ConversationItem] = Field(default_factory=list)
+
+
+class RefineResponse(BaseModel):
+    version_index: int
+    analysis: NutritionalAnalysis
+
+
+async def call_gemini_with_image(
+    prompt: str, image_bytes: bytes, mime_type: str
+) -> "NutritionalAnalysis":
+    image_part = {"mime_type": mime_type, "data": image_bytes}
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    response = model.generate_content(
+        [prompt, image_part],
+        generation_config=genai.GenerationConfig(
+            response_mime_type="application/json",
+        ),
     )
+    return NutritionalAnalysis.model_validate_json(parse_gemini_json_response(response))
 
 
 class MealOut(BaseModel):
@@ -262,67 +355,106 @@ class MealOut(BaseModel):
     confidence_score: float
     cheeky_cat_comment: str
     user_correction_note: str | None = None
+    upload_mode: str = "default"
+    upload_context_text: str | None = None
+    chosen_version_index: int = 0
+    analysis_versions: List[dict[str, Any]] = Field(default_factory=list)
+    conversation: List[dict[str, Any]] = Field(default_factory=list)
     analysis_source: str
     reused_from_meal_id: str | None = None
     image_path: str | None = None
 
 
 # =====================================================================
-# 3. AI 拍照辨識核心路由
+# AI 拍照辨識
 # =====================================================================
 @app.post("/api/analyze-food", response_model=NutritionalAnalysis)
-async def analyze_food(file: UploadFile = File(...)):
+async def analyze_food(
+    file: UploadFile = File(...),
+    context_text: str | None = Form(None),
+):
     mime_type = resolve_image_mime_type(file.content_type, file.filename)
     if not mime_type:
         raise HTTPException(status_code=400, detail="這不是照片喵！請上傳正確的圖片格式。")
 
     try:
-        # 強制重置檔案流指標
         await file.seek(0)
         image_bytes = await read_upload_with_limit(file, MAX_UPLOAD_BYTES)
         if not image_bytes:
             raise HTTPException(status_code=400, detail="上傳的檔案是空的喵！")
 
-        image_part = {"mime_type": mime_type, "data": image_bytes}
-        model = genai.GenerativeModel(GEMINI_MODEL)
-
-        prompt = (
-            "你是一隻叫 CheekyCat 的毒舌健身教練貓，同時也是一位極其嚴格的臨床營養學專家。\n"
-            "請仔細審查這張圖片中的食物，並根據以下 JSON 結構回傳報告，不要有任何多餘的文字。\n\n"
-            "【必須包含的 JSON 鍵值】：\n"
-            '{"dish_name": "字串", "calories_kcal": 整數, "protein_g": 浮點數, "carbs_g": 浮點數, "fat_g": 浮點數, "visual_clues": ["字串列表"], "assumption_and_blindspots": "字串", "confidence_score": 浮點數, "cheeky_cat_comment": "字串"}\n\n'
-            "【三大鋼鐵審計指令】：\n"
-            "1. 科學基準定錨：遵循每 100g 標準成分進行還原估算。\n"
-            "2. 誠實揭露盲點：老實交代 2D 俯拍照片帶來的物理限制，不准隱瞞誤差！\n"
-            "3. 注入機車貓魂：`cheeky_cat_comment` 必須極度毒舌，狠狠吐槽使用者的罪惡熱量，並用『喵～』作為傲嬌語氣的靈魂結尾。"
-        )
-
-        response = model.generate_content(
-            [prompt, image_part],
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-            ),
-        )
-
-        return NutritionalAnalysis.model_validate_json(parse_gemini_json_response(response))
+        prompt = build_analyze_prompt(context_text)
+        return await call_gemini_with_image(prompt, image_bytes, mime_type)
 
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("analyze_food failed")
         detail = "後端大腦抽筋了，請稍後再試。"
-        # 🚀 確保 DEBUG 模式下一定會印出真正的錯誤原因！
+        if DEBUG:
+            detail = f"{detail} 🚨 真兇: {type(e).__name__} -> {str(e)}"
+        raise HTTPException(status_code=500, detail=detail) from e
+
+
+@app.post("/api/analyze-food/refine", response_model=RefineResponse)
+async def refine_food(
+    file: UploadFile = File(...),
+    message: str = Form(...),
+    versions_json: str = Form(...),
+    conversation_json: str = Form("[]"),
+    upload_context_text: str | None = Form(None),
+    _user_id: Annotated[str, Depends(get_current_user_id)] = "",
+):
+    mime_type = resolve_image_mime_type(file.content_type, file.filename)
+    if not mime_type:
+        raise HTTPException(status_code=400, detail="這不是照片喵！請上傳正確的圖片格式。")
+
+    if not message.strip():
+        raise HTTPException(status_code=400, detail="請輸入修正說明")
+
+    versions = _parse_json_form_field(versions_json, "versions_json")
+    if not isinstance(versions, list):
+        raise HTTPException(status_code=400, detail="versions_json 必須為陣列")
+
+    if len(versions) >= REFINE_MAX_ROUNDS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"已達本餐最多 {REFINE_MAX_ROUNDS} 個版本（含初版），無法再修正喵！",
+        )
+
+    conversation = _parse_json_form_field(conversation_json, "conversation_json")
+    if not isinstance(conversation, list):
+        raise HTTPException(status_code=400, detail="conversation_json 必須為陣列")
+
+    try:
+        await file.seek(0)
+        image_bytes = await read_upload_with_limit(file, MAX_UPLOAD_BYTES)
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="上傳的檔案是空的喵！")
+
+        prompt = build_refine_prompt(
+            message, versions, conversation, upload_context_text
+        )
+        analysis = await call_gemini_with_image(prompt, image_bytes, mime_type)
+        version_index = len(versions)
+        return RefineResponse(version_index=version_index, analysis=analysis)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("refine_food failed")
+        detail = "修正分析失敗，請稍後再試。"
         if DEBUG:
             detail = f"{detail} 🚨 真兇: {type(e).__name__} -> {str(e)}"
         raise HTTPException(status_code=500, detail=detail) from e
 
 
 # =====================================================================
-# 4. 日記 API（P1：Supabase meals + service role）
+# 日記 API
 # =====================================================================
 @app.post("/api/meals", response_model=MealOut, status_code=201)
 async def create_meal(
-    body: MealCreate,
+    body: MealCreateP15,
     user_id: Annotated[str, Depends(get_current_user_id)],
 ):
     supabase = get_supabase_admin()
@@ -337,7 +469,12 @@ async def create_meal(
         "assumption_and_blindspots": body.assumption_and_blindspots,
         "confidence_score": body.confidence_score,
         "cheeky_cat_comment": body.cheeky_cat_comment,
-        "user_correction_note": body.user_correction_note,
+        "user_correction_note": None,
+        "upload_mode": body.upload_mode,
+        "upload_context_text": body.upload_context_text,
+        "chosen_version_index": body.chosen_version_index,
+        "analysis_versions": [v.model_dump() for v in body.analysis_versions],
+        "conversation": [c.model_dump() for c in body.conversation],
         "analysis_source": "gemini_fresh",
     }
     try:
