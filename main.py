@@ -15,8 +15,16 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFi
 from supabase import Client, create_client
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 import google.generativeai as genai
+
+from personalities import (
+    DEFAULT_PERSONA,
+    NUTRITION_RULES,
+    PersonaId,
+    normalize_persona_id,
+    persona_tone_block,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +47,7 @@ DEFAULT_CORS_ORIGINS = (
 _raw_origins = os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS)
 CORS_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 DEBUG = os.getenv("DEBUG", "true").lower() in ("1", "true", "yes")
 REFINE_MAX_ROUNDS = int(os.getenv("REFINE_MAX_ROUNDS", "5"))
@@ -79,7 +87,13 @@ EXTENSION_TO_MIME = {
 JSON_SCHEMA_HINT = (
     '{"dish_name": "字串", "calories_kcal": 整數, "protein_g": 浮點數, "carbs_g": 浮點數, '
     '"fat_g": 浮點數, "visual_clues": ["字串列表"], "assumption_and_blindspots": "字串", '
-    '"confidence_score": 浮點數, "cheeky_cat_comment": "字串"}'
+    '"confidence_score": 0.0到1.0的小數(例:0.85=85%信心,禁止1-10或0-100分制), '
+    '"cheeky_cat_comment": "字串"}'
+)
+
+CONFIDENCE_SCORE_PROMPT_LINE = (
+    "4. confidence_score 必須是 0.0～1.0 的小數（例如 0.85 表示 85% 信心），"
+    "禁止使用 1～10 分或 0～100 百分比整數。"
 )
 
 app = FastAPI(title="Project CheekyCat - AI Fitness Backend")
@@ -156,6 +170,22 @@ def parse_gemini_json_response(response) -> str:
     return clean_json
 
 
+def normalize_confidence_score(value: Any) -> float:
+    """Gemini 有時回傳 7.5（十分制）或 75（百分制），統一為 0.0～1.0。"""
+    if value is None:
+        return 0.5
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.5
+    if score > 1:
+        if score <= 10:
+            score /= 10.0
+        elif score <= 100:
+            score /= 100.0
+    return max(0.0, min(1.0, score))
+
+
 def get_current_user_id(
     credentials: Annotated[
         HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
@@ -188,6 +218,33 @@ def get_current_user_id(
     return user_id
 
 
+def get_optional_current_user_id(
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
+    ],
+) -> str | None:
+    if credentials is None or not credentials.credentials:
+        return None
+    if _jwks_client is None:
+        return None
+    token = credentials.credentials
+    try:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["ES256"],
+            audience="authenticated",
+            issuer=SUPABASE_JWT_ISSUER,
+        )
+    except jwt.PyJWTError:
+        return None
+    user_id = payload.get("sub")
+    if not user_id or not isinstance(user_id, str):
+        return None
+    return user_id
+
+
 def get_supabase_admin() -> Client:
     if _supabase_admin is None:
         logger.error("Supabase service role is not configured")
@@ -198,15 +255,65 @@ def get_supabase_admin() -> Client:
     return _supabase_admin
 
 
-def build_analyze_prompt(context_text: str | None) -> str:
+def _get_user_preference_persona(supabase: Client, user_id: str) -> PersonaId:
+    response = (
+        supabase.table("user_preferences")
+        .select("feedback_persona_id")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    rows = response.data or []
+    if rows:
+        return normalize_persona_id(rows[0].get("feedback_persona_id"))
+    supabase.table("user_preferences").insert(
+        {"user_id": user_id, "feedback_persona_id": DEFAULT_PERSONA}
+    ).execute()
+    return DEFAULT_PERSONA
+
+
+def _set_user_preference_persona(
+    supabase: Client, user_id: str, persona_id: PersonaId
+) -> PersonaId:
+    normalized = normalize_persona_id(persona_id)
+    existing = (
+        supabase.table("user_preferences")
+        .select("user_id")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        supabase.table("user_preferences").update(
+            {"feedback_persona_id": normalized}
+        ).eq("user_id", user_id).execute()
+    else:
+        supabase.table("user_preferences").insert(
+            {"user_id": user_id, "feedback_persona_id": normalized}
+        ).execute()
+    return normalized
+
+
+def resolve_persona_for_request(
+    form_persona_id: str | None, user_id: str | None
+) -> PersonaId:
+    if form_persona_id and form_persona_id.strip():
+        return normalize_persona_id(form_persona_id.strip())
+    if user_id:
+        return _get_user_preference_persona(get_supabase_admin(), user_id)
+    return DEFAULT_PERSONA
+
+
+def build_analyze_prompt(
+    context_text: str | None, persona_id: PersonaId
+) -> str:
     prompt = (
-        "你是一隻叫 CheekyCat 的毒舌健身教練貓，同時也是一位極其嚴格的臨床營養學專家。\n"
+        "你是一位極其嚴格的臨床營養學專家，並以指定教練人設撰寫評語。\n"
         "請仔細審查這張圖片中的食物，並根據以下 JSON 結構回傳報告，不要有任何多餘的文字。\n\n"
         f"【必須包含的 JSON 鍵值】：\n{JSON_SCHEMA_HINT}\n\n"
-        "【三大鋼鐵審計指令】：\n"
-        "1. 科學基準定錨：遵循每 100g 標準成分進行還原估算。\n"
-        "2. 誠實揭露盲點：老實交代 2D 俯拍照片帶來的物理限制，不准隱瞞誤差！\n"
-        "3. 注入機車貓魂：`cheeky_cat_comment` 必須極度毒舌，狠狠吐槽使用者的罪惡熱量，並用『喵～』作為傲嬌語氣的靈魂結尾。"
+        f"{NUTRITION_RULES}\n"
+        f"{persona_tone_block(persona_id)}\n"
+        f"{CONFIDENCE_SCORE_PROMPT_LINE}"
     )
     if context_text and context_text.strip():
         prompt += (
@@ -220,19 +327,22 @@ def build_refine_prompt(
     versions: list[dict[str, Any]],
     conversation: list[dict[str, Any]],
     upload_context_text: str | None,
+    persona_id: PersonaId,
 ) -> str:
     versions_blob = json.dumps(versions, ensure_ascii=False, indent=2)
     conversation_blob = json.dumps(conversation, ensure_ascii=False, indent=2)
     prompt = (
-        "你是一隻叫 CheekyCat 的毒舌健身教練貓，同時也是一位極其嚴格的臨床營養學專家。\n"
+        "你是一位極其嚴格的臨床營養學專家，並以指定教練人設撰寫評語。\n"
         "使用者已上傳同一張食物照片，並透過對話要求你修正營養估算。\n"
         "請根據原圖、既有版本、對話歷史與本輪使用者訊息，產出**全新完整**的營養分析 JSON。\n\n"
         f"【必須包含的 JSON 鍵值】：\n{JSON_SCHEMA_HINT}\n\n"
+        f"{NUTRITION_RULES}\n"
+        f"{persona_tone_block(persona_id)}\n"
         f"【既有分析版本】：\n{versions_blob}\n\n"
         f"【對話歷史】：\n{conversation_blob}\n\n"
         f"【本輪使用者修正】：\n{message.strip()}\n\n"
-        "請重新估算熱量與巨量，並在 assumption_and_blindspots 說明你如何採納使用者修正。"
-        "cheeky_cat_comment 維持毒舌繁中並以『喵～』結尾。"
+        "請重新估算熱量與巨量，並在 assumption_and_blindspots 說明你如何採納使用者修正。\n"
+        f"{CONFIDENCE_SCORE_PROMPT_LINE}"
     )
     if upload_context_text and upload_context_text.strip():
         prompt += (
@@ -255,6 +365,9 @@ def _meal_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
         "assumption_and_blindspots": row["assumption_and_blindspots"],
         "confidence_score": row["confidence_score"],
         "cheeky_cat_comment": row["cheeky_cat_comment"],
+        "feedback_persona_id": normalize_persona_id(
+            row.get("feedback_persona_id")
+        ),
         "user_correction_note": row.get("user_correction_note"),
         "upload_mode": row.get("upload_mode") or "default",
         "upload_context_text": row.get("upload_context_text"),
@@ -381,7 +494,19 @@ class NutritionalAnalysis(BaseModel):
     visual_clues: List[str] = Field(description="你在圖片中看到了哪些關鍵食材與視覺線索")
     assumption_and_blindspots: str = Field(description="你在估算時做了什麼份量假設？有哪些物理盲點")
     confidence_score: float = Field(ge=0.0, le=1.0, description="你對這次辨識結果的信心指數（0.0 到 1.0）")
-    cheeky_cat_comment: str = Field(description="毒舌健身教練貓 CheekyCat 的繁體中文機車吐槽")
+    cheeky_cat_comment: str = Field(
+        description="AI 教練對本餐的繁體中文評語（語氣依 persona）"
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_confidence_score(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "confidence_score" not in data:
+            return data
+        return {
+            **data,
+            "confidence_score": normalize_confidence_score(data["confidence_score"]),
+        }
 
 
 class AnalysisVersionItem(NutritionalAnalysis):
@@ -400,8 +525,17 @@ class MealCreateP15(NutritionalAnalysis):
     chosen_version_index: int = Field(ge=0)
     upload_mode: Literal["default", "with_context"] = "default"
     upload_context_text: str | None = None
+    feedback_persona_id: PersonaId = DEFAULT_PERSONA
     analysis_versions: List[AnalysisVersionItem]
     conversation: List[ConversationItem] = Field(default_factory=list)
+
+
+class UserPreferencesOut(BaseModel):
+    feedback_persona_id: PersonaId
+
+
+class UserPreferencesUpdate(BaseModel):
+    feedback_persona_id: PersonaId
 
 
 class RefineResponse(BaseModel):
@@ -420,7 +554,8 @@ async def call_gemini_with_image(
             response_mime_type="application/json",
         ),
     )
-    return NutritionalAnalysis.model_validate_json(parse_gemini_json_response(response))
+    raw = json.loads(parse_gemini_json_response(response))
+    return NutritionalAnalysis.model_validate(raw)
 
 
 class MealOut(BaseModel):
@@ -436,6 +571,7 @@ class MealOut(BaseModel):
     assumption_and_blindspots: str
     confidence_score: float
     cheeky_cat_comment: str
+    feedback_persona_id: PersonaId = DEFAULT_PERSONA
     user_correction_note: str | None = None
     upload_mode: str = "default"
     upload_context_text: str | None = None
@@ -460,10 +596,47 @@ def _meal_row_to_meal_out(supabase: Client, row: dict[str, Any]) -> MealOut:
 # =====================================================================
 # AI 拍照辨識
 # =====================================================================
+@app.get("/api/me/preferences", response_model=UserPreferencesOut)
+async def get_my_preferences(
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    supabase = get_supabase_admin()
+    try:
+        persona_id = _get_user_preference_persona(supabase, user_id)
+    except Exception as exc:
+        logger.exception("get_my_preferences failed")
+        detail = "無法讀取教練偏好。"
+        if DEBUG:
+            detail = f"{detail} ({type(exc).__name__}: {exc})"
+        raise HTTPException(status_code=500, detail=detail) from exc
+    return UserPreferencesOut(feedback_persona_id=persona_id)
+
+
+@app.patch("/api/me/preferences", response_model=UserPreferencesOut)
+async def patch_my_preferences(
+    body: UserPreferencesUpdate,
+    user_id: Annotated[str, Depends(get_current_user_id)],
+):
+    supabase = get_supabase_admin()
+    try:
+        persona_id = _set_user_preference_persona(
+            supabase, user_id, body.feedback_persona_id
+        )
+    except Exception as exc:
+        logger.exception("patch_my_preferences failed")
+        detail = "無法更新教練偏好。"
+        if DEBUG:
+            detail = f"{detail} ({type(exc).__name__}: {exc})"
+        raise HTTPException(status_code=500, detail=detail) from exc
+    return UserPreferencesOut(feedback_persona_id=persona_id)
+
+
 @app.post("/api/analyze-food", response_model=NutritionalAnalysis)
 async def analyze_food(
     file: UploadFile = File(...),
     context_text: str | None = Form(None),
+    persona_id: str | None = Form(None),
+    optional_user_id: Annotated[str | None, Depends(get_optional_current_user_id)] = None,
 ):
     mime_type = resolve_image_mime_type(file.content_type, file.filename)
     if not mime_type:
@@ -475,7 +648,10 @@ async def analyze_food(
         if not image_bytes:
             raise HTTPException(status_code=400, detail="上傳的檔案是空的喵！")
 
-        prompt = build_analyze_prompt(context_text)
+        resolved_persona = resolve_persona_for_request(
+            persona_id, optional_user_id
+        )
+        prompt = build_analyze_prompt(context_text, resolved_persona)
         return await call_gemini_with_image(prompt, image_bytes, mime_type)
 
     except HTTPException:
@@ -495,7 +671,8 @@ async def refine_food(
     versions_json: str = Form(...),
     conversation_json: str = Form("[]"),
     upload_context_text: str | None = Form(None),
-    _user_id: Annotated[str, Depends(get_current_user_id)] = "",
+    persona_id: str | None = Form(None),
+    user_id: Annotated[str, Depends(get_current_user_id)] = "",
 ):
     mime_type = resolve_image_mime_type(file.content_type, file.filename)
     if not mime_type:
@@ -524,8 +701,9 @@ async def refine_food(
         if not image_bytes:
             raise HTTPException(status_code=400, detail="上傳的檔案是空的喵！")
 
+        resolved_persona = resolve_persona_for_request(persona_id, user_id)
         prompt = build_refine_prompt(
-            message, versions, conversation, upload_context_text
+            message, versions, conversation, upload_context_text, resolved_persona
         )
         analysis = await call_gemini_with_image(prompt, image_bytes, mime_type)
         version_index = len(versions)
@@ -577,6 +755,7 @@ async def create_meal(
         "assumption_and_blindspots": body.assumption_and_blindspots,
         "confidence_score": body.confidence_score,
         "cheeky_cat_comment": body.cheeky_cat_comment,
+        "feedback_persona_id": normalize_persona_id(body.feedback_persona_id),
         "user_correction_note": None,
         "upload_mode": body.upload_mode,
         "upload_context_text": body.upload_context_text,
